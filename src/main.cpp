@@ -10,8 +10,16 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <csignal>
+#include <signal.h>
 
 using namespace std;
+
+volatile sig_atomic_t interrumpido = 0;
+
+void manejarSigint(int señal){
+	interrumpido = 1;
+}
 
 struct Actividad {
 	string id_actividad;
@@ -20,6 +28,7 @@ struct Actividad {
 	vector<string> dependencias;
 	vector<string> dependientes;
 	int grado_entrada;
+	bool abortada = false;
 };
 
 string trim(const string &texto){
@@ -74,6 +83,13 @@ bool hayCiclo(unordered_map<string, Actividad> &actividades){
 
 int main(int argc, char *argv[]) {
 	srand(time(nullptr));
+
+	struct sigaction sa;
+	sa.sa_handler = manejarSigint;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	sigaction(SIGINT, &sa, nullptr);
+
 	unordered_map<string, Actividad> actividades;
 
 	if (argc < 3){
@@ -144,7 +160,7 @@ int main(int argc, char *argv[]) {
 	}
 
 	if (hayCiclo(actividades)){
-		cerr << "Error: el plan contiene un ciclo, no es un DAG válido." << endl;
+		cerr << "Error: el plan contiene un ciclo, no es un DAG valido." << endl;
 		return 1;
 	}
 
@@ -160,14 +176,40 @@ int main(int argc, char *argv[]) {
 	int total = actividades.size();
 	unordered_map<pid_t, string> pid_a_id;
 
-	while (terminadas < total){
-		while (corriendo < K && !cola_listos.empty()){
+	while (terminadas < total && !interrumpido){
+		while (corriendo < K && !cola_listos.empty() && !interrumpido){
 			string id_actual = cola_listos.front();
 			cola_listos.pop();
+
+			int fd[2];
+			if (pipe(fd) == -1){
+				cerr << "Error al crear pipe para actividad " << id_actual << endl;
+				return 1;
+			}
+
+			string mensaje = "Insumo de: ";
+			for (const string &dep : actividades[id_actual].dependencias){
+				mensaje += actividades[dep].nombre_actividad + " ";
+			}
 
 			pid_t pid = fork();
 
 			if (pid == 0){
+				close(fd[1]);
+
+				char buffer[256];
+				int bytes_leidos = read(fd[0], buffer, sizeof(buffer) - 1);
+				if (bytes_leidos > 0){
+					buffer[bytes_leidos] = '\0';
+					cout << "Actividad " << id_actual << " recibio: " << buffer << endl;
+				}
+				close(fd[0]);
+
+				if (rand() % 100 < 5){
+					cerr << "Actividad " << id_actual << " fallo." << endl;
+					exit(1);
+				}
+
 				int tiempo_ms = actividades[id_actual].tiempo_ms;
 				struct timespec ts;
 				ts.tv_sec = tiempo_ms / 1000;
@@ -177,6 +219,10 @@ int main(int argc, char *argv[]) {
 				exit(0);
 			}
 			else if (pid > 0){
+				close(fd[0]);
+				write(fd[1], mensaje.c_str(), mensaje.size());
+				close(fd[1]);
+
 				pid_a_id[pid] = id_actual;
 				corriendo++;
 			}
@@ -189,19 +235,65 @@ int main(int argc, char *argv[]) {
 		if (corriendo > 0){
 			int status;
 			pid_t pid_terminado = waitpid(-1, &status, 0);
-			corriendo--;
-			terminadas++;
+			if (pid_terminado > 0){
+				corriendo--;
+				terminadas++;
 
-			string id_terminado = pid_a_id[pid_terminado];
+				string id_terminado = pid_a_id[pid_terminado];
+				bool fallo = WIFEXITED(status) && WEXITSTATUS(status) != 0;
 
-			for (const string &dep_id : actividades[id_terminado].dependientes){
-				actividades[dep_id].grado_entrada--;
-				if (actividades[dep_id].grado_entrada == 0){
-					cola_listos.push(dep_id);
+				if (fallo){
+					cerr << "Actividad " << id_terminado << " fallo, abortando dependientes." << endl;
+					queue<string> por_abortar;
+					for (const string &dep_id : actividades[id_terminado].dependientes){
+						por_abortar.push(dep_id);
+					}
+					while (!por_abortar.empty()){
+						string actual_abortar = por_abortar.front();
+						por_abortar.pop();
+						if (actividades[actual_abortar].abortada){
+							continue;
+						}
+						actividades[actual_abortar].abortada = true;
+						terminadas++;
+						cerr << "Actividad " << actual_abortar << " abortada (dependia de " << id_terminado << ")." << endl;
+						for (const string &siguiente : actividades[actual_abortar].dependientes){
+							por_abortar.push(siguiente);
+						}
+					}
+				}
+				else {
+					for (const string &dep_id : actividades[id_terminado].dependientes){
+						if (actividades[dep_id].abortada){
+							continue;
+						}
+						actividades[dep_id].grado_entrada--;
+						if (actividades[dep_id].grado_entrada == 0){
+							cola_listos.push(dep_id);
+						}
+					}
 				}
 			}
 		}
 	}
 
+	if (interrumpido){
+		cerr << endl << "Senal SIGINT recibida, abortando actividades en curso..." << endl;
+
+		for (const auto &par : pid_a_id){
+			kill(par.first, SIGTERM);
+		}
+
+		int procesos_restantes = corriendo;
+		for (int i = 0; i < procesos_restantes; i++){
+			int status;
+			waitpid(-1, &status, 0);
+		}
+
+		cout << "Resumen: " << terminadas << " actividades finalizadas de " << total << " totales." << endl;
+		return 1;
+	}
+
+	cout << "Todas las actividades finalizaron. Total: " << terminadas << "/" << total << endl;
 	return 0;
 }
